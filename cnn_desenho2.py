@@ -1,0 +1,345 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Oculta logs desnecessários do TensorFlow
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import numpy as np
+from PIL import Image, ImageDraw
+import tkinter as tk
+from tkinter import messagebox
+from scipy.ndimage import center_of_mass, shift
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import time
+
+print("=== A carregar o dataset MNIST globalmente ===")
+(X_train_full, y_train_full), (_, _) = tf.keras.datasets.mnist.load_data()
+
+
+# --- FUNÇÃO PRINCIPAL DA INTERFACE DE DESENHO E REDE NEURAL ---
+def iniciar_app_principal(num_amostras, epocas, neuronios_lista):
+    # Preparar e normalizar os dados
+    X_treino = X_train_full[:num_amostras].astype(float) / 255.0
+    X_treino = X_treino.reshape((num_amostras, 28, 28, 1))
+    y_treino = y_train_full[:num_amostras]
+
+    # --- CONSTRUÇÃO DINÂMICA DA CNN (API FUNCIONAL) ---
+    entrada = layers.Input(shape=(28, 28, 1), name='entrada')
+    x = layers.Conv2D(32, (3, 3), activation='relu', name='conv2d')(entrada)
+    x = layers.MaxPooling2D((2, 2), name='max_pooling')(x)
+    x = layers.Flatten(name='flatten')(x)
+
+    for i, n_neur in enumerate(neuronios_lista):
+        x = layers.Dense(n_neur, activation='relu', name=f'camada_oculta_{i}')(x)
+
+    saida = layers.Dense(10, activation='softmax', name='camada_saida')(x)
+    model = models.Model(inputs=entrada, outputs=saida, name='cnn_dinamica')
+
+    model.compile(optimizer='adam',
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
+
+    print(f"-> A treinar o modelo ({num_amostras} amostras | {epocas} épocas)...")
+    model.fit(X_treino, y_treino, epochs=epocas, verbose=1)
+    print("-> Treino concluído com sucesso!")
+
+    modelos_ocultas = [
+        tf.keras.Model(inputs=model.input, outputs=model.get_layer(f'camada_oculta_{i}').output)
+        for i in range(len(neuronios_lista))
+    ]
+    modelo_saida = tf.keras.Model(inputs=model.input, outputs=model.get_layer('camada_saida').output)
+
+    # --- CRIAR JANELA PRINCIPAL ---
+    janela = tk.Tk()
+    janela.title("Rede Neural Profunda - Histórico e Tempo Real")
+    janela.geometry("940x630")
+    janela.resizable(False, False)
+
+    # Frame Esquerdo (Painel de Desenho e Logs)
+    frame_esquerdo = tk.Frame(janela, width=330, bg="#f0f0f0")
+    frame_esquerdo.pack(side=tk.LEFT, fill=tk.BOTH, padx=10, pady=10)
+
+    label_instrucao = tk.Label(frame_esquerdo, text="Desenhe um dígito abaixo:", font=("Arial", 11, "bold"), bg="#f0f0f0")
+    label_instrucao.pack(pady=5)
+
+    canvas = tk.Canvas(frame_esquerdo, width=280, height=280, bg="white", cursor="cross", highlightthickness=1, highlightbackground="gray")
+    canvas.pack(pady=5)
+
+    label_resultado = tk.Label(frame_esquerdo, text="Previsto: - (Confiança: 0.0%)", font=("Arial", 11, "bold"), fg="blue", bg="#f0f0f0")
+    label_resultado.pack(pady=5)
+
+    # --- CAMPO DE LOGS DAS ÚLTIMAS PREVISÕES ---
+    label_log_titulo = tk.Label(frame_esquerdo, text="Histórico de Previsões:", font=("Arial", 9, "bold"), bg="#f0f0f0")
+    label_log_titulo.pack(anchor="w", padx=5, pady=(5, 0))
+
+    log_text = tk.Text(frame_esquerdo, height=7, width=36, font=("Courier", 9), state=tk.DISABLED, bg="white")
+    log_text.pack(padx=5, pady=2)
+
+    def adicionar_ao_log(digito, confianca):
+        log_text.config(state=tk.NORMAL)
+        timestamp = time.strftime("%H:%M:%S")
+        log_text.insert(tk.END, f"[{timestamp}] Previsto: {digito} ({confianca:.1f}%)\n")
+        log_text.see(tk.END)  # Mantém a barra de scroll sempre no final
+        log_text.config(state=tk.DISABLED)
+
+    img_pil = Image.new("L", (280, 280), 255)
+    draw = ImageDraw.Draw(img_pil)
+
+    def limpar_tela():
+        canvas.delete("all")
+        draw.rectangle([0, 0, 280, 280], fill=255)
+        label_resultado.config(text="Previsto: - (Confiança: 0.0%)")
+        atualizar_previsao(limpar=True)
+
+    btn_limpar = tk.Button(frame_esquerdo, text="Limpar Tela", bg="red", fg="white", font=("Arial", 9, "bold"), command=limpar_tela)
+    btn_limpar.pack(fill=tk.X, padx=5, pady=3)
+
+    def abrir_configuracao():
+        janela.destroy()
+        criar_janela_configuracao()
+
+    btn_config = tk.Button(frame_esquerdo, text="⚙️ Alterar Parâmetros / Retreinar", bg="darkorange", fg="white", font=("Arial", 9, "bold"), command=abrir_configuracao)
+    btn_config.pack(fill=tk.X, padx=5, pady=3)
+
+    # Frame Direito (Gráfico da Rede Neural)
+    frame_direito = tk.Frame(janela, width=580)
+    frame_direito.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    fig = Figure(figsize=(6.0, 5.5), dpi=100)
+    num_camadas = len(neuronios_lista)
+    fig.suptitle(f"Caminho Ativo pelos Neurónios Mais Fortes ({num_camadas} Camadas)", fontsize=11, fontweight='bold')
+    ax = fig.add_subplot(111)
+    ax.axis('off')
+
+    x_coords = [i + 1.0 for i in range(num_camadas)]
+    x_saida = num_camadas + 1.0
+    y_base = np.linspace(0, 9, 12)
+
+    linhas_ocultas = []
+    for c in range(num_camadas - 1):
+        linhas_camada = []
+        x_atual, x_prox = x_coords[c], x_coords[c+1]
+        for yo in y_base:
+            linhas_no = []
+            for yp in y_base:
+                linha, = ax.plot([x_atual, x_prox], [yo, yp], color='#666666', alpha=0.15, linewidth=0.6)
+                linhas_no.append(linha)
+            linhas_camada.append(linhas_no)
+        linhas_ocultas.append(linhas_camada)
+
+    linhas_saida_por_digito = []
+    if num_camadas > 0:
+        x_ultima = x_coords[-1]
+        y_saida_pos = np.linspace(0.5, 8.5, 10)
+        for i, ys in enumerate(y_saida_pos):
+            linhas_digito = []
+            for yo in y_base:
+                linha, = ax.plot([x_ultima, x_saida], [yo, ys], color='#666666', alpha=0.2, linewidth=0.7)
+                linhas_digito.append(linha)
+            linhas_saida_por_digito.append(linhas_digito)
+
+    scatters_ocultos = []
+    indices_ocultos_por_camada = []
+    for c, n_neur in enumerate(neuronios_lista):
+        num_visiveis = min(12, n_neur)
+        passo = max(1, n_neur // num_visiveis)
+        inds = [i * passo for i in range(num_visiveis)]
+        indices_ocultos_por_camada.append(inds)
+        
+        sc = ax.scatter([x_coords[c]] * num_visiveis, y_base[:num_visiveis], s=280, c=np.zeros(num_visiveis), cmap='Purples', vmin=0, vmax=5, edgecolor='black', linewidths=1.5, zorder=3)
+        scatters_ocultos.append(sc)
+        ax.text(x_coords[c], 9.8, f"C. Oculta {c+1}\n({num_visiveis}/{n_neur})", ha='center', fontweight='bold', fontsize=8)
+
+    y_saida_pos = np.linspace(0.5, 8.5, 10)
+    sc_saida = ax.scatter([x_saida] * 10, y_saida_pos, s=380, c=np.zeros(10), cmap='Greens', vmin=0, vmax=1, edgecolor='black', linewidths=1.5, zorder=3)
+    ax.text(x_saida, 9.8, "Saída (10)", ha='center', fontweight='bold', fontsize=8.5)
+
+    textos_saida = []
+    for i, y in enumerate(y_saida_pos):
+        t = ax.text(x_saida + 0.18, y, f"Dígito {i}: 0.0%", va='center', fontsize=8, color='black', fontweight='bold')
+        textos_saida.append(t)
+
+    ax.set_xlim(0.3, x_saida + 1.8)
+    ax.set_ylim(-1, 11)
+    fig.tight_layout()
+
+    canvas_matplotlib = FigureCanvasTkAgg(fig, master=frame_direito)
+    canvas_matplotlib.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def atualizar_previsao(limpar=False, registar_log=False):
+        img_resized = img_pil.resize((28, 28), Image.Resampling.LANCZOS)
+        img_arr = np.array(img_resized, dtype=float)
+        img_arr = 255.0 - img_arr
+        img_arr = img_arr / 255.0
+        
+        if limpar or np.sum(img_arr) < 0.5:
+            for c in range(num_camadas):
+                scatters_ocultos[c].set_array(np.zeros(len(indices_ocultos_por_camada[c])))
+            sc_saida.set_array(np.zeros(10))
+            for i, t in enumerate(textos_saida):
+                t.set_text(f"Dígito {i}: 0.0%")
+                t.set_color('black')
+                t.set_fontweight('normal')
+            
+            for c in range(num_camadas - 1):
+                for yo_idx in range(len(y_base)):
+                    for yp_idx in range(len(y_base)):
+                        linhas_ocultas[c][yo_idx][yp_idx].set_color('#666666')
+                        linhas_ocultas[c][yo_idx][yp_idx].set_alpha(0.15)
+                        linhas_ocultas[c][yo_idx][yp_idx].set_linewidth(0.6)
+
+            if num_camadas > 0:
+                for linhas_digito in linhas_saida_por_digito:
+                    for linha in linhas_digito:
+                        linha.set_color('#666666')
+                        linha.set_alpha(0.15)
+                        linha.set_linewidth(0.6)
+            fig.canvas.draw_idle()
+            return
+
+        if np.sum(img_arr) > 0:
+            cy, cx = center_of_mass(img_arr)
+            rows, cols = img_arr.shape
+            shift_y = np.round(rows / 2.0 - cy).astype(int)
+            shift_x = np.round(cols / 2.0 - cx).astype(int)
+            img_arr = shift(img_arr, [shift_y, shift_x], cval=0.0)
+        
+        img_input = img_arr.reshape(1, 28, 28, 1)
+        
+        ativacoes_camadas = []
+        for c, mod_oc in enumerate(modelos_ocultas):
+            ativacoes = mod_oc.predict(img_input, verbose=0)[0]
+            ativacoes_camadas.append(ativacoes)
+            inds = indices_ocultos_por_camada[c]
+            scatters_ocultos[c].set_array(ativacoes[inds])
+            
+        probabilidades = modelo_saida.predict(img_input, verbose=0)[0]
+        digito_previsto = np.argmax(probabilidades)
+        confianca = np.max(probabilidades) * 100
+        
+        label_resultado.config(text=f"Previsto: {digito_previsto} (Confiança: {confianca:.1f}%)")
+        sc_saida.set_array(probabilidades)
+        
+        for i, t in enumerate(textos_saida):
+            pct = probabilidades[i] * 100
+            t.set_text(f"Dígito {i}: {pct:.1f}%")
+            if i == digito_previsto:
+                t.set_color('green')
+                t.set_fontweight('bold')
+            else:
+                t.set_color('black')
+                t.set_fontweight('normal')
+
+        # Se o utilizador concluiu o traço, adiciona a predição ao campo de logs
+        if registar_log:
+            adicionar_ao_log(digito_previsto, confianca)
+
+        indices_mais_fortes = []
+        for c in range(num_camadas):
+            ativacoes_visiveis = ativacoes_camadas[c][indices_ocultos_por_camada[c]]
+            idx_forte = int(np.argmax(ativacoes_visiveis))
+            indices_mais_fortes.append(idx_forte)
+
+        for c in range(num_camadas - 1):
+            for yo_idx in range(len(y_base)):
+                for yp_idx in range(len(y_base)):
+                    linhas_ocultas[c][yo_idx][yp_idx].set_color('#666666')
+                    linhas_ocultas[c][yo_idx][yp_idx].set_alpha(0.15)
+                    linhas_ocultas[c][yo_idx][yp_idx].set_linewidth(0.6)
+
+        for c in range(num_camadas - 1):
+            forte_atual = indices_mais_fortes[c]
+            forte_seguinte = indices_mais_fortes[c+1]
+            linha_ativa = linhas_ocultas[c][forte_atual][forte_seguinte]
+            linha_ativa.set_color('green')
+            linha_ativa.set_alpha(0.85)
+            linha_ativa.set_linewidth(2.2)
+
+        if num_camadas > 0:
+            for d_idx, linhas_digito in enumerate(linhas_saida_por_digito):
+                is_winner = (d_idx == digito_previsto)
+                for yo_idx, linha in enumerate(linhas_digito):
+                    if is_winner and yo_idx == indices_mais_fortes[-1]:
+                        linha.set_color('green')
+                        linha.set_alpha(0.85)
+                        linha.set_linewidth(2.2)
+                    else:
+                        linha.set_color('#666666')
+                        linha.set_alpha(0.15)
+                        linha.set_linewidth(0.6)
+
+        fig.canvas.draw_idle()
+
+    last_x, last_y = None, None
+    job_id = None
+
+    def iniciar_traco(event):
+        nonlocal last_x, last_y
+        last_x, last_y = event.x, event.y
+
+    def desenhar(event):
+        nonlocal last_x, last_y, job_id
+        if last_x is not None and last_y is not None:
+            canvas.create_line(last_x, last_y, event.x, event.y, width=6, fill="black", capstyle=tk.ROUND, joinstyle=tk.ROUND)
+            draw.line([last_x, last_y, event.x, event.y], fill=0, width=6)
+        last_x, last_y = event.x, event.y
+        if job_id is not None:
+            janela.after_cancel(job_id)
+        job_id = janela.after(80, lambda: atualizar_previsao(registar_log=False))
+
+    def libertar_rato(event):
+        nonlocal last_x, last_y
+        last_x, last_y = None, None
+        # Regista o resultado final assim que o utilizador liberta o rato
+        atualizar_previsao(registar_log=True)
+
+    canvas.bind("<Button-1>", iniciar_traco)
+    canvas.bind("<B1-Motion>", desenhar)
+    canvas.bind("<ButtonRelease-1>", libertar_rato)
+    janela.mainloop()
+
+
+# --- JANELA GRÁFICA DE CONFIGURAÇÃO INICIAL ---
+def criar_janela_configuracao():
+    cfg = tk.Tk()
+    cfg.title("Configuração da Rede Neural")
+    cfg.geometry("380x300")
+    cfg.resizable(False, False)
+
+    tk.Label(cfg, text="Definição de Parâmetros e Arquitetura", font=("Arial", 11, "bold")).pack(pady=12)
+
+    frame_form = tk.Frame(cfg)
+    frame_form.pack(pady=5)
+
+    tk.Label(frame_form, text="Amostras de Treino:", font=("Arial", 10)).grid(row=0, column=0, sticky="w", pady=6)
+    e_amostras = tk.Entry(frame_form, width=16, font=("Arial", 10))
+    e_amostras.insert(0, "5000")
+    e_amostras.grid(row=0, column=1, pady=6)
+
+    tk.Label(frame_form, text="Épocas:", font=("Arial", 10)).grid(row=1, column=0, sticky="w", pady=6)
+    e_epocas = tk.Entry(frame_form, width=16, font=("Arial", 10))
+    e_epocas.insert(0, "3")
+    e_epocas.grid(row=1, column=1, pady=6)
+
+    tk.Label(frame_form, text="Neurónios por Camada\n(ex: 64,32):", font=("Arial", 10)).grid(row=2, column=0, sticky="w", pady=6)
+    e_neuronios = tk.Entry(frame_form, width=16, font=("Arial", 10))
+    e_neuronios.insert(0, "64,32")
+    e_neuronios.grid(row=2, column=1, pady=6)
+
+    def submeter():
+        try:
+            amostras = int(e_amostras.get())
+            epocas = int(e_epocas.get())
+            neuronios = [int(n.strip()) for n in e_neuronios.get().split(",")]
+            cfg.destroy()
+            iniciar_app_principal(amostras, epocas, neuronios)
+        except Exception as e:
+            messagebox.showerror("Erro de Formato", f"Verifique os valores introduzidos:\n{e}")
+
+    btn_iniciar = tk.Button(cfg, text="Treinar e Iniciar", bg="green", fg="white", font=("Arial", 10, "bold"), width=20, command=submeter)
+    btn_iniciar.pack(pady=15)
+
+    cfg.mainloop()
+
+
+if __name__ == "__main__":
+    criar_janela_configuracao()
